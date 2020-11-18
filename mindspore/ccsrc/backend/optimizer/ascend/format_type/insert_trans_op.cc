@@ -1,0 +1,66 @@
+/**
+ * Copyright 2019 Huawei Technologies Co., Ltd
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#include "backend/optimizer/ascend/format_type/insert_trans_op.h"
+#include <memory>
+#include <vector>
+#include "utils/utils.h"
+#include "backend/optimizer/common/helper.h"
+#include "backend/optimizer/ascend/ascend_helper.h"
+#include "backend/session/anf_runtime_algorithm.h"
+#include "utils/ms_context.h"
+
+namespace mindspore {
+namespace opt {
+const BaseRef InsertTransOp::DefinePattern() const {
+  std::shared_ptr<Var> V = std::make_shared<CondVar>(UnVisited);
+  std::shared_ptr<Var> Xs = std::make_shared<SeqVar>();
+  return VectorRef({V, Xs});
+}
+
+bool IsGraphOutput(const AnfNodePtr &node, const FuncGraphPtr &func_graph) {
+  auto outputs = AnfAlgo::GetAllOutput(func_graph->output(), {prim::kPrimTupleGetItem});
+  auto iter = std::find(outputs.begin(), outputs.end(), node);
+  if (iter != outputs.end() && GetRealNodeNum(func_graph, node) == 1) {
+    return true;
+  }
+  return false;
+}
+
+const AnfNodePtr InsertTransOp::Process(const FuncGraphPtr &func_graph, const AnfNodePtr &node,
+                                        const EquivPtr &) const {
+  if (node == nullptr || !AnfAlgo::IsRealKernel(node)) {
+    return nullptr;
+  }
+  AnfAlgo::SetNodeAttr(kAttrVisited, MakeValue(true), node);
+  MS_LOG(DEBUG) << "process op: " << node->DebugString();
+  AnfNodePtr new_node = InsertTransOpForInput(func_graph, node, kernel_select_);
+  auto kernel_graph = func_graph->cast<std::shared_ptr<session::KernelGraph>>();
+  if (kernel_graph != nullptr && kernel_graph->IsInternalOutput(node)) {
+    kernel_graph->ReplaceInternalOutput(node, new_node);
+  }
+  auto ms_context = MsContext::GetInstance();
+  MS_EXCEPTION_IF_NULL(ms_context);
+  if (ms_context->get_param<int>(MS_CTX_EXECUTION_MODE) == kPynativeMode &&
+      !ms_context->get_param<bool>(MS_CTX_ENABLE_PYNATIVE_HOOK)) {
+    if (IsGraphOutput(node, func_graph)) {
+      return new_node;
+    }
+  }
+  return InsertTransOpForOutput(func_graph, new_node, kernel_select_);
+}
+}  // namespace opt
+}  // namespace mindspore
