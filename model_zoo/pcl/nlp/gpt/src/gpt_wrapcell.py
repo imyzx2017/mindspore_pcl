@@ -29,7 +29,7 @@ from mindspore.common.parameter import Parameter
 from src.utils import ClipByGlobalNorm
 
 GRADIENT_CLIP_TYPE = 1
-GRADIENT_CLIP_VALUE = 1.0
+GRADIENT_CLIP_VALUE = 1.0  # transformer示例中，grad clip的值为5.0，差异是否影响计算
 clip_grad = C.MultitypeFuncGraph("clip_grad")
 
 @clip_grad.register("Number", "Number", "Tensor")
@@ -55,12 +55,28 @@ def _clip_grad(clip_type, clip_value, grad):
         new_grad = nn.ClipByNorm()(grad, F.cast(F.tuple_to_array((clip_value,)), dt))
     return new_grad
 
+# grad_scale = C.MultitypeFuncGraph("grad_scale")
+# reciprocal = P.Reciprocal()
+
+# @grad_scale.register("Tensor", "Tensor")
+# def tensor_grad_scale(scale, grad):
+#     return grad * reciprocal(scale)
+
+
 grad_scale = C.MultitypeFuncGraph("grad_scale")
 reciprocal = P.Reciprocal()
 
+
 @grad_scale.register("Tensor", "Tensor")
 def tensor_grad_scale(scale, grad):
-    return grad * reciprocal(scale)
+    return grad * F.cast(reciprocal(scale), F.dtype(grad))
+
+_grad_overflow = C.MultitypeFuncGraph("_grad_overflow")
+grad_overflow = P.FloatStatus()
+
+@_grad_overflow.register("Tensor")
+def _tensor_grad_overflow(grad):
+    return grad_overflow(grad)
 
 class GPTTrainOneStepWithLossScaleCell(nn.Cell):
     """
@@ -95,9 +111,17 @@ class GPTTrainOneStepWithLossScaleCell(nn.Cell):
             self.grad_reducer = DistributedGradReducer(optimizer.parameters, False, self.degree)
         self.is_distributed = (self.parallel_mode != ParallelMode.STAND_ALONE)
         self.cast = P.Cast()
-        self.alloc_status = P.NPUAllocFloatStatus()
-        self.get_status = P.NPUGetFloatStatus()
-        self.clear_before_grad = P.NPUClearFloatStatus()
+        # Add GPU config codes
+        if context.get_context("device_target") == "GPU":
+            self.gpu_target = True
+            self.float_status = P.FloatStatus()
+            self.addn = P.AddN()
+            self.reshape = P.Reshape()
+        else:
+            self.gpu_target = False
+            self.alloc_status = P.NPUAllocFloatStatus()
+            self.get_status = P.NPUGetFloatStatus()
+            self.clear_before_grad = P.NPUClearFloatStatus()
         self.reduce_sum = P.ReduceSum(keep_dims=False)
         self.depend_parameter_use = P.ControlDepend(depend_mode=1)
         self.base = Tensor(1, mstype.float32)
@@ -123,14 +147,19 @@ class GPTTrainOneStepWithLossScaleCell(nn.Cell):
             scaling_sens = self.loss_scale
         else:
             scaling_sens = sens
+        ########
+        init = False
+        ############
+        
         # alloc status and clear should be right before gradoperation
-        init = self.alloc_status()
-        self.clear_before_grad(init)
+        if not self.gpu_target:
+            init = self.alloc_status()
+            self.clear_before_grad(init)
         grads = self.grad(self.network, weights)(input_ids,
                                                  past,
                                                  self.cast(scaling_sens,
                                                            mstype.float32))
-        # apply grad reducer on grads
+        # apply grad reducer on grads(这里和transformer示例不一致，reducer_flag=False是不执行grad_reducer的)
         grads = self.grad_reducer(grads)
         grads = self.hyper_map(F.partial(grad_scale, scaling_sens * self.degree), grads)
 
@@ -139,14 +168,26 @@ class GPTTrainOneStepWithLossScaleCell(nn.Cell):
         else:
             grads = self.hyper_map(F.partial(clip_grad, GRADIENT_CLIP_TYPE, GRADIENT_CLIP_VALUE), grads)
 
-        self.get_status(init)
-        flag_sum = self.reduce_sum(init, (0,))
+        ###
+        if not self.gpu_target:
+            self.get_status(init)
+            # sum overflow buffer elements, 0: not overflow, >0: overflow
+            flag_sum = self.reduce_sum(init, (0,))
+            
+        ###
+        else:
+            flag_sum = self.hyper_map(F.partial(_grad_overflow), grads)
+            flag_sum = self.addn(flag_sum)
+            # convert flag_sum to scalar
+            flag_sum = self.reshape(flag_sum, (()))
+            
         if self.is_distributed:
             # sum overflow flag over devices
             flag_reduce = self.allreduce(flag_sum)
             cond = self.less_equal(self.base, flag_reduce)
         else:
             cond = self.less_equal(self.base, flag_sum)
+            
         overflow = cond
         if sens is None:
             overflow = self.loss_scaling_manager(self.loss_scale, cond)
@@ -154,5 +195,6 @@ class GPTTrainOneStepWithLossScaleCell(nn.Cell):
             succ = False
         else:
             succ = self.optimizer(grads)
+            
         ret = (loss, cond, scaling_sens)
         return F.depend(ret, succ)
