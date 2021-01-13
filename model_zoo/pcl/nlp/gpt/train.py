@@ -17,7 +17,6 @@
 GPT train script
 """
 
-
 import os
 import argparse
 from mindspore import context
@@ -33,6 +32,11 @@ from src.dataset import create_dataset
 from src.gpt import GPT, GPTWithLoss, CrossEntropyLoss
 from src.gpt_wrapcell import GPTTrainOneStepWithLossScaleCell
 from src.utils import GPTConfig, LearningRate
+
+##
+from mindspore._checkparam import check_input_data, check_output_data, Validator
+from mindspore.communication.management import init, get_rank, get_group_size
+
 
 def run_train():
     """train function for GPT"""
@@ -50,10 +54,9 @@ def run_train():
     parser.add_argument("--end_lr", type=float, default="1e-10", help="End learning rate, default is 1e-10.")
     parser.add_argument("--sink_size", type=int, default=100, help="Sink size for every iteration, default is 100")
 
-
     args_opt = parser.parse_args()
     device_id = int(os.getenv("DEVICE_ID"))
-    context.set_context(mode=context.GRAPH_MODE, device_target="Ascend", device_id=device_id)
+    context.set_context(mode=context.GRAPH_MODE, device_target="GPU", device_id=device_id)
     if args_opt.distribute == "true":
         D.init()
         device_num = args_opt.device_num
@@ -68,7 +71,7 @@ def run_train():
         rank = 0
         device_num = 1
 
-    config = GPTConfig(batch_size=4,
+    config = GPTConfig(batch_size=2,
                        seq_length=1024,
                        vocab_size=50257,
                        embedding_size=1024,
@@ -83,16 +86,22 @@ def run_train():
     loss = CrossEntropyLoss(config)
     gpt_with_loss = GPTWithLoss(gpt, loss)
 
-    ds = create_dataset(config.batch_size, data_path=args_opt.data_path, device_num=device_num, rank=rank)
-
+    # Add multi-GPUs
+    if args_opt.distribute == "true":
+        rank_id = get_rank()
+        rank_size = get_group_size()
+        print("Current rank id is: {}, rank_size is: {}".format(rank_id, rank_size))
+        ds = create_dataset(config.batch_size, data_path=args_opt.data_path, device_num=device_num, rank=rank_id)
+    else:
+        ds = create_dataset(config.batch_size, data_path=args_opt.data_path, device_num=device_num, rank=rank)
 
     epoch_num = args_opt.epoch_size
     step_per_epoch = ds.get_dataset_size()
-
+    print("step_per_epoch: {}".format(step_per_epoch))
     lr = LearningRate(learning_rate=args_opt.start_lr,
                       end_learning_rate=args_opt.end_lr,
                       warmup_steps=args_opt.warmup_step,
-                      decay_steps=epoch_num*step_per_epoch)
+                      decay_steps=epoch_num * step_per_epoch)
 
     decay_filter = lambda x: 'layernorm' not in x.name.lower() and "bias" not in x.name.lower()
     params = gpt.trainable_params()
@@ -107,14 +116,14 @@ def run_train():
     else:
         optimizer = nn.AdamWeightDecay(group_params, learning_rate=lr)
 
+    print('Defined optimizer!')
     callback_size = args_opt.sink_size
-    actual_epoch_num = int(epoch_num * step_per_epoch/callback_size)
+    actual_epoch_num = int(epoch_num * step_per_epoch / callback_size)
     callback = [TimeMonitor(callback_size), LossMonitor(callback_size)]
 
     config_ck = CheckpointConfig(save_checkpoint_steps=step_per_epoch, keep_checkpoint_max=1)
-    ckpoint_cb = ModelCheckpoint(prefix="GPT2", config=config_ck)
+    ckpoint_cb = ModelCheckpoint(prefix="GPT3", config=config_ck)
     callback.append(ckpoint_cb)
-
 
     update_cell = DynamicLossScaleUpdateCell(loss_scale_value=1024,
                                              scale_factor=2,
@@ -123,10 +132,22 @@ def run_train():
     gpt_with_grads = GPTTrainOneStepWithLossScaleCell(gpt_with_loss, optimizer=optimizer,
                                                       scale_update_cell=update_cell)
 
-
     model = Model(gpt_with_grads)
+    print('Do training!')
+    print('epochs: {}'.format(actual_epoch_num))
     model.train(actual_epoch_num, ds, callbacks=callback, sink_size=callback_size)
 
+
+#     epoch = actual_epoch_num
+#     train_dataset = ds
+#     sink_size = callback_size
+#     #dataset_sink_mode = Validator.check_bool(True)
+#     if sink_size == -1:
+#         sink_size = train_dataset.get_dataset_size()
+#     #Validator.check_is_int(sink_size)
+#     if sink_size < -1 or sink_size == 0:
+#         raise ValueError("The sink_size must be -1 or positive, but got sink_size {}.".format(sink_size))
+#     print('Pass')
 
 if __name__ == "__main__":
     set_seed(12315)
